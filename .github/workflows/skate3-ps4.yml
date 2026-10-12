@@ -1,0 +1,969 @@
+# Положить в: .github/workflows/skate3-ps4.yml  (репозиторий skate3-ps4-port, лучше ПРИВАТНЫЙ)
+#
+# Secrets (Settings → Secrets and variables → Actions):
+#   GAME_URL         - ссылка на 7z с ISO игры: Google Drive (полная ссылка или ID) ИЛИ прямая http(s)-ссылка.
+#                      Можно вместо секрета ввести в поле game_url при запуске.
+#   TU3_URL          - ссылка на пакет TU_12K2276_000000C000000.00000000000O3 (Drive или прямая). Не нужна, если он уже в 7z
+#   ARCHIVE_PASSWORD - пароль от 7z (если архив без пароля - не создавай)
+#   ORBIS_SDK_URL    - (опц.) ссылка на бандл orbis-sdk-v1; если пусто - ищется автоматически в релизах orbis-ports
+#   ORBIS_PUB_URL    - ссылка на orbis-pub-cmd 3.87 (exe или rar/zip/7z; нужен только для AIO)
+#   ART_ZIP_URL      - (опц.) zip с icon0.png, pic1.png и defaults\save\ . Без него рисуются заглушки
+#
+# Игра должна быть ТВОЕЙ копией (дамп своего диска) - в README репо так и сказано.
+
+name: Skate3 PS4 - game + toolchain
+
+on:
+  workflow_dispatch:
+    inputs:
+      game_url:
+        description: "Ссылка на 7z с ISO (Google Drive или прямая). Пусто = секрет GAME_URL"
+        type: string
+        default: ""
+      tu3_url:
+        description: "Ссылка на пакет TU3 (TU_12K2276_...O3). Пусто = секрет TU3_URL"
+        type: string
+        default: ""
+      tu3_from_upstream:
+        description: "Скачать TU3 тем же способом, что установщик skate3recomp (URL берётся из его исходников). Если не получится - используется твой файл"
+        type: boolean
+        default: true
+      skate3recomp_before:
+        description: "Взять последний коммит апстрима skate3recomp НЕ ПОЗЖЕ этой даты (YYYY-MM-DD, например 2026-09-30). Пусто = без ограничения"
+        type: string
+        default: ""
+      skate3recomp_ref:
+        description: "Тег/коммит апстрима skate3recomp (например v2.0.2). Пусто = последний main. Меняй вместе с cache_version"
+        type: string
+        default: ""
+      cache_version:
+        description: "Версия кэша. Меняй (v2, v3...) если сменил игру/TU3 или хочешь пересобрать codegen с нуля"
+        type: string
+        default: "v1"
+      build_eboot:
+        description: "Собрать только PS4 eboot (без pkg) + диагностика. Для отладки линковки"
+        type: boolean
+        default: true
+      build_ps4:
+        description: "Собрать PS4 eboot + обычный pkg (make-pkg.ps1)"
+        type: boolean
+        default: false
+      build_aio:
+        description: "Собрать AIO pkg с игрой внутри (make-aio.ps1), нужен eboot"
+        type: boolean
+        default: true
+
+env:
+  WS: C:\ws
+  LLVM_VERSION: "22.1.8"
+  OPENORBIS_TAG: v0.5.4
+  SKATE3_WORKSPACE: C:\ws
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  prepare:
+    runs-on: windows-2022
+    timeout-minutes: 350
+    steps:
+      # ---------- 0. Репозиторий и папка workspace ----------
+      # CRLF ломает git apply (патчи в LF), поэтому выключаем autocrlf ДО любых checkout/clone
+      - name: Git - no CRLF conversion
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+          git config --global core.longpaths true
+
+      - name: Checkout this repo -> workspace
+        uses: actions/checkout@v4
+        with:
+          path: ws/skate3-ps4-port
+
+      # ---------- Кэш: чтобы после падения НЕ начинать с нуля ----------
+      # codegen (самая долгая часть) и libc++ сохраняются сразу после успешного шага,
+      # поэтому падение на PS4-сборке/линковке больше не стоит 30+ минут повторной работы.
+      - name: Restore cache - codegen result (skate3recomp без game\)
+        id: cg
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            C:/ws/skate3recomp/**
+            !C:/ws/skate3recomp/game
+            !C:/ws/skate3recomp/game/**
+          key: codegen-${{ inputs.cache_version }}-${{ inputs.skate3recomp_ref || 'main' }}-${{ inputs.skate3recomp_before || 'latest' }}-${{ hashFiles('ws/skate3-ps4-port/patches/**') }}
+
+      - name: Restore cache - libc++ for PS4
+        id: lx
+        uses: actions/cache/restore@v4
+        with:
+          path: C:/ws/libcxx-ps4
+          key: libcxx-${{ inputs.cache_version }}-${{ env.LLVM_VERSION }}-${{ hashFiles('ws/skate3-ps4-port/toolchain/libcxx-ps4.cmake', 'ws/skate3-ps4-port/patches/llvm-libcxx.patch') }}
+
+      - name: Cache status
+        run: |
+          "codegen cache hit: ${{ steps.cg.outputs.cache-hit }}"
+          "libc++  cache hit: ${{ steps.lx.outputs.cache-hit }}"
+
+      - name: Move workspace to C:\ws
+        run: |
+          New-Item -ItemType Directory -Force $env:WS | Out-Null
+          # Move-Item между дисками (D: -> C:) падает на read-only файлах в .git, поэтому robocopy
+          robocopy "$env:GITHUB_WORKSPACE\ws\skate3-ps4-port" "$env:WS\skate3-ps4-port" /E /MOVE /NFL /NDL /NJH /NJS /NP | Out-Null
+          if ($LASTEXITCODE -ge 8) { throw "robocopy failed ($LASTEXITCODE)" }
+          $global:LASTEXITCODE = 0
+          foreach ($d in 'skate3recomp','orbis-sdk-v1','oo054','libcxx-ps4','art','tools','dl') {
+            New-Item -ItemType Directory -Force "$env:WS\$d" | Out-Null
+          }
+          Get-PSDrive C | Format-Table Used,Free
+
+      # ---------- 1. Компиляторы и инструменты (как в README) ----------
+      - name: MSVC x64 build tools (host codegen + PC build)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Python 3.12 (auto)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          check-latest: true
+
+      - name: Ensure 7-Zip
+        run: |
+          if (-not (Get-Command 7z -ErrorAction SilentlyContinue)) {
+            if (Test-Path "C:\Program Files\7-Zip\7z.exe") {
+              "C:\Program Files\7-Zip" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+            } else { choco install 7zip -y --no-progress }
+          }
+
+      - uses: actions/setup-dotnet@v4      # для PkgTool.Core
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: CMake 4.x, Ninja, gdown
+        run: python -m pip install --upgrade pip cmake ninja gdown requests
+
+      - name: LLVM/clang ${{ env.LLVM_VERSION }}
+        run: |
+          $v = $env:LLVM_VERSION
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$v/LLVM-$v-win64.exe"
+          Invoke-WebRequest $url -OutFile "$env:WS\dl\llvm.exe"
+          Start-Process "$env:WS\dl\llvm.exe" -ArgumentList '/S' -Wait
+          "C:\Program Files\LLVM\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          Remove-Item "$env:WS\dl\llvm.exe"
+
+      - name: Rust + xdvdfs (распаковка Xbox 360 ISO)
+        if: ${{ steps.cg.outputs.cache-hit != 'true' || inputs.build_aio }}
+        run: cargo install xdvdfs-cli --locked
+
+      # ---------- 2. Игра с Google Диска ----------
+      - name: Write download helper (fetch.py)
+        run: |
+          @'
+          import os, re, sys, gdown, requests
+          url, out = sys.argv[1], sys.argv[2]
+          m = re.search(r"(?:/d/|[?&]id=)([A-Za-z0-9_-]{20,})", url) or \
+              (re.fullmatch(r"[A-Za-z0-9_-]{20,}", url) and re.match(r"(.+)", url))
+          if "drive.google" in url or "docs.google" in url or (not url.startswith("http") and m):
+              fid = m.group(1)
+              r = gdown.download(id=fid, output=out, quiet=False)
+              if not r: sys.exit("Drive: скачивание не удалось (квота / доступ?)")
+          else:
+              with requests.get(url, stream=True, timeout=60) as r:
+                  r.raise_for_status()
+                  with open(out, "wb") as f:
+                      for ch in r.iter_content(1 << 22): f.write(ch)
+          print("OK %.2f GB" % (os.path.getsize(out) / 2**30))
+          '@ | Set-Content -Encoding utf8 "$env:WS\dl\fetch.py"
+
+      - name: Download game 7z (Google Drive or direct link)
+        if: ${{ steps.cg.outputs.cache-hit != 'true' || inputs.build_aio }}
+        env:
+          GAME_URL: ${{ inputs.game_url || secrets.GAME_URL }}
+        run: |
+          if (-not $env:GAME_URL) { throw "Не задана ссылка на игру: поле game_url или секрет GAME_URL" }
+          python "$env:WS\dl\fetch.py" $env:GAME_URL "$env:WS\dl\game.7z"
+          if ($LASTEXITCODE) { throw "fetch failed" }
+
+      - name: Extract 7z (рекурсивно, вложенные архивы тоже)
+        if: ${{ steps.cg.outputs.cache-hit != 'true' || inputs.build_aio }}
+        env:
+          ARCHIVE_PASSWORD: ${{ secrets.ARCHIVE_PASSWORD }}
+        run: |
+          $out = "$env:WS\dl\unpacked"
+          function Un7z($file, $dest) {
+            $a = @('x', $file, "-o$dest", '-y')
+            if ($env:ARCHIVE_PASSWORD) { $a += "-p$env:ARCHIVE_PASSWORD" }
+            & 7z @a | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "7z extract failed: $file" }
+          }
+          Un7z "$env:WS\dl\game.7z" $out
+          Remove-Item "$env:WS\dl\game.7z"
+          # вложенные 7z/zip/rar внутри (если ISO запакован ещё раз)
+          Get-ChildItem $out -Recurse -Include *.7z,*.zip,*.rar | ForEach-Object {
+            Un7z $_.FullName $_.DirectoryName; Remove-Item $_.FullName
+          }
+          Get-ChildItem $out -Recurse | Select-Object -First 40 FullName,Length
+
+      - name: Extract ISO -> skate3recomp\game (default.xex, data\, ...)
+        if: ${{ steps.cg.outputs.cache-hit != 'true' || inputs.build_aio }}
+        run: |
+          $game = "$env:WS\skate3recomp\game"
+          # ВАЖНО: чистим game\ целиком. После восстановления кэша там могли остаться пустые папки
+          # (например game\data), и xdvdfs падал с "os error 183 (file already exists)".
+          if (Test-Path $game) { Remove-Item $game -Recurse -Force }
+          New-Item -ItemType Directory -Force $game | Out-Null
+          "$env:USERPROFILE\.cargo\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          $env:PATH += ";$env:USERPROFILE\.cargo\bin"
+          $iso = Get-ChildItem "$env:WS\dl\unpacked" -Recurse -Filter *.iso | Sort-Object Length -Descending | Select-Object -First 1
+          if ($iso) {
+            "ISO: $($iso.FullName)  ($([math]::Round($iso.Length/1GB,2)) GB)"
+            # xdvdfs сам ищет смещение раздела с игрой (XGD1/XGD2/XGD3)
+            xdvdfs ls $iso.FullName / 2>&1 | Select-Object -First 15
+            xdvdfs unpack $iso.FullName $game
+            $ok = ($LASTEXITCODE -eq 0) -and (Test-Path "$game\default.xex")
+            if (-not $ok) {
+              Write-Warning "unpack в существующую папку не удался, пробуем в НЕсуществующую временную"
+              Remove-Item $game -Recurse -Force -ErrorAction SilentlyContinue
+              $tmp = "$env:WS\dl\iso_out"
+              if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+              xdvdfs unpack $iso.FullName $tmp
+              if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$tmp\default.xex")) { throw "xdvdfs не смог распаковать образ (см. вывод выше)" }
+              New-Item -ItemType Directory -Force $game | Out-Null
+              robocopy $tmp $game /E /MOVE /NFL /NDL /NJH /NJS /NP | Out-Null
+              if ($LASTEXITCODE -ge 8) { throw "robocopy failed ($LASTEXITCODE)" }
+              $global:LASTEXITCODE = 0
+            }
+          } else {
+            # в архиве уже распакованная игра
+            $xex = Get-ChildItem "$env:WS\dl\unpacked" -Recurse -Filter default.xex | Select-Object -First 1
+            if (-not $xex) { throw "Ни ISO, ни default.xex в архиве не найдено" }
+            Copy-Item "$($xex.DirectoryName)\*" $game -Recurse -Force
+          }
+          # TU3: по README skate3recomp пакет кладётся В КОРЕНЬ репозитория под ОРИГИНАЛЬНЫМ именем
+          # (кодегенератор сам вытащит из него патчи). Переименовывать в default.xexp НЕЛЬЗЯ -
+          # это STFS-контейнер, а не xexp (из-за этого был 0xc0000001).
+          $tuPkg = Get-ChildItem "$env:WS\dl\unpacked" -Recurse -File -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Name -like 'TU_12K2276*' } | Select-Object -First 1
+          if ($tuPkg) { Copy-Item $tuPkg.FullName "$env:WS\skate3recomp\$($tuPkg.Name)" -Force; "TU3 пакет: $($tuPkg.Name)" }
+          # уже распакованные настоящие .xexp (если есть в архиве) - копируем как есть
+          Get-ChildItem "$env:WS\dl\unpacked" -Recurse -File -Filter *.xexp -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item $_.FullName "$game\$($_.Name)" -Force; "Staged: $($_.Name)" }
+          # обязательные файлы
+          foreach ($need in 'default.xex') {
+            if (-not (Test-Path "$game\$need")) { throw "$need не найден после распаковки" }
+          }
+          if (-not (Test-Path "$game\data")) { Write-Warning "Папки data\ нет - проверь содержимое образа" }
+          Get-ChildItem $game | Select-Object Name
+          Remove-Item -Recurse -Force "$env:WS\dl\unpacked"   # освободить место
+
+      - name: Stage Title Update 3 package (любое имя TU_12K2276*, без расширения - это нормально)
+        if: ${{ steps.cg.outputs.cache-hit != 'true' }}
+        env:
+          TU3_URL: ${{ inputs.tu3_url || secrets.TU3_URL }}
+        run: |
+          $root = "$env:WS\skate3recomp"
+          # у пакетов Xbox 360 расширения нет - имя вроде TU_12K2276_000000C000000.<хэш>
+          $tu = Get-ChildItem $root -File -Filter 'TU_12K2276*' | Select-Object -First 1
+          if (-not $tu -and $env:TU3_URL) {
+            python "$env:WS\dl\fetch.py" $env:TU3_URL "$root\TU3.package"
+            if ($LASTEXITCODE) { throw "TU3 download failed" }
+            $tu = Get-Item "$root\TU3.package"
+          }
+          if (-not $tu) {
+            throw "Нет пакета TU3 (TU_12K2276_*): положи его в 7z или задай TU3_URL."
+          }
+          # проверка заголовка STFS: magic, тип контента, Title ID (0x360, у Skate 3 = 454108E6)
+          $bytes = [System.IO.File]::ReadAllBytes($tu.FullName)
+          $magic = [System.Text.Encoding]::ASCII.GetString($bytes[0..3])
+          $ctype = ('{0:X8}' -f ([BitConverter]::ToUInt32(@($bytes[0x347],$bytes[0x346],$bytes[0x345],$bytes[0x344]),0)))
+          $tid   = ('{0:X8}' -f ([BitConverter]::ToUInt32(@($bytes[0x363],$bytes[0x362],$bytes[0x361],$bytes[0x360]),0)))
+          "TU3: $($tu.Name)  $([math]::Round($tu.Length/1MB,1)) MB  magic='$magic'  content-type=$ctype  titleId=$tid"
+          if ($magic -notin 'LIVE','PIRS','CON ') { throw "Не STFS-пакет (magic '$magic') - скорее всего скачалась HTML-страница, а не файл" }
+          if ($ctype -ne '000B0000') { Write-Warning "content-type $ctype - ожидался 000B0000 (Title Update)" }
+          if ($tid -ne '454108E6')   { Write-Warning "titleId $tid - у Skate 3 должен быть 454108E6; возможно не тот пакет" }
+          "TU3_PATH=$($tu.FullName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      # ---------- 3. Исходники и SDK ----------
+      - name: Clone skate3recomp (submodules; imgui pinned на d94d0f364, как в README)
+        if: ${{ steps.cg.outputs.cache-hit != 'true' }}
+        env:
+          S3_REF: ${{ inputs.skate3recomp_ref }}
+          S3_BEFORE: ${{ inputs.skate3recomp_before }}
+        run: |
+          git config --global core.longpaths true
+          # Клонируем ПРЯМО в C:\ws\skate3recomp (там уже лежит game\), без копирования/переноса:
+          # robocopy падал (код 11) на read-only файлах .git и длинных путях сабмодулей.
+          $src = "$env:WS\skate3recomp"
+          git -C $src init
+          git -C $src remote add origin https://github.com/mchughalex/skate3recomp
+          $ref = if ($env:S3_REF) { $env:S3_REF } else { 'HEAD' }
+          "skate3recomp ref: $ref"
+          if ($ref -match '^[0-9a-fA-F]{7,40}$') {
+            # хэш коммита (в т.ч. короткий): тянем всю историю и переходим на него
+            git -C $src fetch origin HEAD '+refs/heads/*:refs/remotes/origin/*'
+            if ($LASTEXITCODE) { throw "fetch skate3recomp failed" }
+            $full = (git -C $src rev-parse --verify "$ref^{commit}").Trim()
+            if (-not $full) { throw "Коммит $ref не найден в skate3recomp" }
+            $pinnedSha = $full
+          } else {
+            git -C $src fetch origin $ref
+            if ($LASTEXITCODE) { throw "fetch skate3recomp ($ref) failed" }
+          }
+          $target = if ($pinnedSha) { $pinnedSha } else { 'FETCH_HEAD' }
+          if ($env:S3_BEFORE) {
+            # последний коммит апстрима не позже указанной даты (коммит порта мог быть сделан под него)
+            $sha = (git -C $src rev-list -1 --before="$env:S3_BEFORE 23:59:59" $target).Trim()
+            if (-not $sha) { throw "Нет коммитов skate3recomp до $env:S3_BEFORE" }
+            $target = $sha
+          }
+          git -C $src checkout -f $target
+          if ($LASTEXITCODE) { throw "checkout skate3recomp failed" }
+          "skate3recomp commit: $(git -C $src log -1 --format='%H  %cd  %s')"
+
+          # Рекурсивно инициализируем сабмодули, но imgui пропускаем: его закреплённый коммит
+          # пропал из апстрима (README), берём d94d0f364 вручную.
+          function Sub($repo) {
+            if (-not (Test-Path "$repo\.gitmodules")) { return }
+            $paths = git -C $repo config -f .gitmodules --get-regexp '^submodule\..*\.path$' |
+                     ForEach-Object { ($_ -split ' ', 2)[1] }
+            foreach ($p in $paths) {
+              if ($p -match '(^|/)imgui$') {
+                $dir = Join-Path $repo $p
+                if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
+                git clone https://github.com/ocornut/imgui $dir
+                git -C $dir checkout d94d0f364
+                if ($LASTEXITCODE) { throw "imgui d94d0f364 не найден" }
+                continue
+              }
+              git -C $repo submodule update --init -- $p
+              if ($LASTEXITCODE) { throw "submodule $p failed" }
+              Sub (Join-Path $repo $p)
+            }
+          }
+          Sub $src
+
+          Get-ChildItem "$src\game" | Select-Object -First 5 Name   # игра на месте
+          Test-Path "$src\.git"
+
+      - name: TU3 как у установщика skate3recomp (URL ищем в его исходниках)
+        if: ${{ steps.cg.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        env:
+          USE_UPSTREAM: ${{ inputs.tu3_from_upstream }}
+        run: |
+          $root = "$env:WS\skate3recomp"
+          "=== где в исходниках апстрима задан адрес TU3 ==="
+          $files = Get-ChildItem "$root\src","$root\config","$root\cmake","$root\CMakeLists.txt" -Recurse -File -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Extension -in '.cpp','.h','.hpp','.toml','.cmake','.txt','.json','.md' }
+          $hits = $files | Select-String -Pattern 'title_update_url|TitleUpdateUrl|title_update.*https?://' -Context 0,4
+          $hits | Select-Object -First 10 | ForEach-Object { $_.ToString() }
+          $urls = @()
+          foreach ($h in $hits) {
+            foreach ($l in @($h.Line) + @($h.Context.PostContext)) {
+              foreach ($m in [regex]::Matches($l, 'https?://[^\s"''<>)\\]+')) { $urls += $m.Value }
+            }
+          }
+          $urls = $urls | Where-Object { $_ -notmatch 'github\.com|microsoft\.com|docs\.' } | Select-Object -Unique
+          "Найденные URL: " + ($urls -join ' | ')
+          if (-not $urls) { "URL не найден в исходниках - остаётся твой файл TU3"; exit 0 }
+
+          $dest = "$root\TU3.upstream"
+          $name = 'TU_12K2276_000000C000000.00000000000O3'
+          $good = $false
+          foreach ($u in $urls) {
+            foreach ($cand in @($u, ($u.TrimEnd('/') + '/' + $name))) {
+              try {
+                if (Test-Path $dest) { Remove-Item $dest -Force }
+                python "$env:WS\dl\fetch.py" $cand $dest 2>&1 | Select-Object -Last 2
+                if (-not (Test-Path $dest)) { continue }
+                $b = [System.IO.File]::ReadAllBytes($dest)
+                if ($b.Length -lt 1024) { continue }
+                $magic = [System.Text.Encoding]::ASCII.GetString($b[0..3])
+                if ($magic -in 'LIVE','PIRS','CON ') { "OK: $cand  ($($b.Length) байт, magic=$magic)"; $good = $true; break }
+              } catch { "не вышло: $cand ($($_.Exception.Message))" }
+            }
+            if ($good) { break }
+          }
+          if (-not $good) { "Скачать пакет из апстрима не удалось - остаётся твой файл TU3"; exit 0 }
+
+          $upHash = (Get-FileHash $dest -Algorithm SHA256).Hash
+          $myHash = if ($env:TU3_PATH -and (Test-Path $env:TU3_PATH)) { (Get-FileHash $env:TU3_PATH -Algorithm SHA256).Hash } else { '(нет)' }
+          "SHA256 upstream TU3: $upHash  size=$((Get-Item $dest).Length)"
+          "SHA256 твой TU3    : $myHash  size=$(if ($env:TU3_PATH -and (Test-Path $env:TU3_PATH)) { (Get-Item $env:TU3_PATH).Length })"
+          if ($upHash -eq $myHash) { "ТВОЙ TU3 ИДЕНТИЧЕН апстримному - дело не в нём" }
+          else {
+            "ТВОЙ TU3 ОТЛИЧАЕТСЯ от апстримного"
+            if ($env:USE_UPSTREAM -eq 'true') { "TU3_PATH=$dest" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV; "-> используем апстримный TU3 для codegen" }
+          }
+
+      - name: OpenOrbis PS4 Toolchain ${{ env.OPENORBIS_TAG }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          "--- ассеты релиза $env:OPENORBIS_TAG ---"
+          gh release view $env:OPENORBIS_TAG -R OpenOrbis/OpenOrbis-PS4-Toolchain --json assets -q '.assets[].name'
+          gh release download $env:OPENORBIS_TAG -R OpenOrbis/OpenOrbis-PS4-Toolchain -D "$env:WS\dl\oo"
+          Get-ChildItem "$env:WS\dl\oo" -File | ForEach-Object {
+            if ($_.Extension -in '.zip','.7z','.rar') { & 7z x $_.FullName "-o$env:WS\oo054" -y | Out-Null }
+            elseif ($_.Name -match '\.tar\.(gz|xz|bz2)$|\.tgz$') {
+              & 7z x $_.FullName "-o$env:WS\dl\oo-tar" -y | Out-Null
+              Get-ChildItem "$env:WS\dl\oo-tar" -Filter *.tar | ForEach-Object { & 7z x $_.FullName "-o$env:WS\oo054" -y | Out-Null }
+            }
+          }
+          # нужны Windows-инструменты (create-gp4.exe, PkgTool.Core). Нет в релизе - берём из дерева репозитория по тегу
+          $gp4 = Get-ChildItem "$env:WS\oo054" -Recurse -Filter 'create-gp4*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $gp4) {
+            "create-gp4.exe в релизе нет - пробуем репозиторий по тегу"
+            $src = "$env:WS\dl\oo-src"
+            git clone --depth 1 --branch $env:OPENORBIS_TAG https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain $src
+            $gp4 = Get-ChildItem $src -Recurse -Filter 'create-gp4*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($gp4) {
+              New-Item -ItemType Directory -Force "$env:WS\oo054\bin\windows" | Out-Null
+              Copy-Item "$($gp4.DirectoryName)\*" "$env:WS\oo054\bin\windows" -Recurse -Force
+              # заодно libc.prx / libSceFios2.prx и прочее из дерева репозитория, если в релизе их не было
+              foreach ($d in 'lib','include','link.x') {
+                if ((Test-Path "$src\$d") -and -not (Test-Path "$env:WS\oo054\$d")) { Copy-Item "$src\$d" "$env:WS\oo054\$d" -Recurse -Force }
+              }
+            }
+          }
+          "--- структура oo054 (папки, глубина 3) ---"
+          Get-ChildItem "$env:WS\oo054" -Recurse -Depth 3 -Directory -ErrorAction SilentlyContinue | Select-Object -First 40 FullName
+          "--- инструменты ---"
+          Get-ChildItem "$env:WS\oo054" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'create-gp4|PkgTool|create-fself|create-eboot|\.prx$' } | Select-Object -First 30 FullName
+
+      - name: orbis-sdk-v1 (orbis-ports bundle) - авто-поиск в релизах
+        env:
+          ORBIS_SDK_URL: ${{ secrets.ORBIS_SDK_URL }}   # необязательно: ручная ссылка имеет приоритет
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $dl = "$env:WS\dl\orbis-sdk"
+          New-Item -ItemType Directory -Force $dl | Out-Null
+          $file = $null
+          if ($env:ORBIS_SDK_URL) {
+            $file = "$dl\orbis-sdk-v1.bin"
+            python "$env:WS\dl\fetch.py" $env:ORBIS_SDK_URL $file
+            if ($LASTEXITCODE) { throw "Не скачалось по ORBIS_SDK_URL" }
+          } else {
+            # Репозитории из Credits в README; ищем релиз/ассет с именем orbis-sdk-v1
+            foreach ($repo in 'orbis-ports/orbis-porting-kit','orbis-ports/orbis-compat') {
+              $rels = gh api "repos/$repo/releases?per_page=100" 2>$null | ConvertFrom-Json
+              foreach ($r in $rels) {
+                $asset = $r.assets | Where-Object { $_.name -match 'orbis-sdk' } | Select-Object -First 1
+                if (-not $asset -and $r.tag_name -match 'orbis-sdk') { $asset = $r.assets | Select-Object -First 1 }
+                if ($asset) {
+                  "Найдено: $repo @ $($r.tag_name) -> $($asset.name)"
+                  gh release download $r.tag_name -R $repo -p $asset.name -D $dl --clobber
+                  $file = Join-Path $dl $asset.name; break
+                }
+              }
+              if ($file) { break }
+            }
+            if (-not $file) {
+              foreach ($repo in 'orbis-ports/orbis-porting-kit','orbis-ports/orbis-compat') {
+                "--- релизы $repo ---"; gh release list -R $repo -L 20
+              }
+              throw "orbis-sdk-v1 не найден в релизах orbis-ports. Задай секрет ORBIS_SDK_URL со ссылкой на бандл."
+            }
+          }
+          # распаковка: zip / 7z / tar.gz / tar.xz
+          $dest = "$env:WS\orbis-sdk-v1"
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          & 7z x $file "-o$dest" -y | Out-Null
+          if ($LASTEXITCODE) { throw "Не удалось распаковать $file" }
+          Get-ChildItem $dest -Recurse -Include *.tar | ForEach-Object {
+            & 7z x $_.FullName "-o$($_.DirectoryName)" -y | Out-Null; Remove-Item $_.FullName
+          }
+          # если внутри одна корневая папка - поднять содержимое на уровень выше
+          $items = Get-ChildItem $dest
+          if ($items.Count -eq 1 -and $items[0].PSIsContainer) {
+            robocopy $items[0].FullName $dest /E /MOVE /NFL /NDL /NJH /NJS /NP | Out-Null
+            $global:LASTEXITCODE = 0
+          }
+          Get-ChildItem $dest | Select-Object -First 20 Name
+
+      - name: orbis-pub-cmd (optional, AIO only) - exe или архив rar/zip/7z по ссылке
+        env:
+          ORBIS_PUB_URL: ${{ secrets.ORBIS_PUB_URL }}
+        run: |
+          if (-not $env:ORBIS_PUB_URL) { "ORBIS_PUB_URL не задан - AIO собирать не будем"; exit 0 }
+          New-Item -ItemType Directory -Force "$env:WS\tools" | Out-Null
+          $dl = "$env:WS\dl\pub.bin"
+          python "$env:WS\dl\fetch.py" $env:ORBIS_PUB_URL $dl      # Drive, GitHub release или любая прямая ссылка
+          if ($LASTEXITCODE) { throw "Не скачалось по ORBIS_PUB_URL" }
+          $head = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($dl)[0..1])
+          if ($head -eq 'MZ') {
+            Copy-Item $dl "$env:WS\tools\orbis-pub-cmd.exe" -Force           # это сам exe
+          } else {
+            $x = "$env:WS\dl\pub"
+            if (Test-Path $x) { Remove-Item $x -Recurse -Force }
+            & 7z x $dl "-o$x" -y | Out-Null                                    # rar / zip / 7z
+            if ($LASTEXITCODE) { throw "Не удалось распаковать архив с orbis-pub-cmd (нужен пароль?)" }
+            $exe = Get-ChildItem $x -Recurse -Filter 'orbis-pub-cmd.exe' | Select-Object -First 1
+            if (-not $exe) { Get-ChildItem $x -Recurse | Select-Object -First 30 FullName; throw "orbis-pub-cmd.exe в архиве не найден" }
+            # кладём ВСЮ папку рядом: у инструмента есть соседние dll
+            Copy-Item "$($exe.DirectoryName)\*" "$env:WS\tools" -Recurse -Force
+          }
+          "orbis-pub-cmd: $((Get-Item "$env:WS\tools\orbis-pub-cmd.exe").Length) байт; файлов в tools\: $((Get-ChildItem "$env:WS\tools" -File).Count)"
+
+      # ---------- 4. Патчи (README, шаг 3) ----------
+      - name: Apply patches (с проверкой - раньше ошибки молча игнорировались)
+        if: ${{ steps.cg.outputs.cache-hit != 'true' }}
+        working-directory: C:\ws\skate3recomp
+        run: |
+          $P = "$env:WS\skate3-ps4-port\patches"
+          function Apply($dir, $patch) {
+            "--- $patch -> $dir"
+            Push-Location $dir
+            git apply --check --ignore-whitespace "$P\$patch" 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              # возможно уже применён (повторный запуск) - тогда reverse-check проходит
+              git apply --check -R --ignore-whitespace "$P\$patch" 2>$null
+              if ($LASTEXITCODE -eq 0) { "уже применён"; Pop-Location; return }
+              Pop-Location
+              throw "Патч $patch не применяется к $dir (см. вывод выше)"
+            }
+            git apply --ignore-whitespace --whitespace=nowarn "$P\$patch"
+            if ($LASTEXITCODE -ne 0) { Pop-Location; throw "git apply $patch failed" }
+            Pop-Location
+          }
+          $sdk = "$env:WS\skate3recomp\third_party\rexglue-sdk"
+          "=== что порт-патчи говорят про exception_compat / 82F44E40 ==="
+          Get-ChildItem $P -Filter *.patch | Select-String -Pattern 'exception_compat|82F44E40' -Context 2,2 |
+            Select-Object -First 12 | ForEach-Object { $_.ToString() }
+          "=== апстрим: $(git -C "$env:WS\skate3recomp" log -1 --format='%h %cd' 2>&1) ==="
+          Apply "$env:WS\skate3recomp" 'skate3recomp.patch'
+          Apply $sdk 'rexglue-sdk.patch'
+          Apply "$sdk\thirdparty\FFmpeg"  'rexglue-sdk-FFmpeg.patch'
+          Apply "$sdk\thirdparty\glslang" 'rexglue-sdk-glslang.patch'
+          # проверка: строки RasterizerGamma из imgui_drawer.cpp должны быть закомментированы
+          $bad = Select-String -Path "$sdk\src\ui\imgui_drawer.cpp" -Pattern '^\s*[A-Za-z_]+\.RasterizerGamma'
+          if ($bad) { $bad | ForEach-Object { $_.ToString() }; throw "RasterizerGamma не закомментирован - патч SDK не сработал" }
+
+      # ---------- 5. libc++ 22 для PS4 (README, шаг 2) ----------
+      - name: Build libc++/libc++abi for PS4
+        if: ${{ steps.lx.outputs.cache-hit != 'true' }}
+        run: |
+          git clone --depth 1 --branch "llvmorg-$env:LLVM_VERSION" https://github.com/llvm/llvm-project "$env:WS\llvm-project"
+          Push-Location "$env:WS\llvm-project"
+          git apply "$env:WS\skate3-ps4-port\patches\llvm-libcxx.patch"
+          Pop-Location
+          # ПРОВЕРЬ: аргументы зависят от содержимого toolchain\libcxx-ps4.cmake
+          cmake -S "$env:WS\llvm-project\runtimes" -B "$env:WS\libcxx-build" -G Ninja `
+            -C "$env:WS\skate3-ps4-port\toolchain\libcxx-ps4.cmake" `
+            -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi" `
+            -DCMAKE_INSTALL_PREFIX="$env:WS\libcxx-ps4"
+          ninja -C "$env:WS\libcxx-build" install-cxx install-cxxabi
+          Remove-Item -Recurse -Force "$env:WS\llvm-project","$env:WS\libcxx-build"
+
+      - name: Save cache - libc++ for PS4
+        if: ${{ steps.lx.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: C:/ws/libcxx-ps4
+          key: ${{ steps.lx.outputs.cache-primary-key }}
+
+      # ---------- 6. Codegen на хосте (PC build, README, шаг 1) ----------
+      - name: Codegen (generate-all)
+        if: ${{ steps.cg.outputs.cache-hit != 'true' }}
+        working-directory: C:\ws\skate3recomp
+        run: |
+          $game = "$env:WS\skate3recomp\game"
+          $tuPkg = $env:TU3_PATH
+          # предпроверка входных файлов (требования README skate3recomp)
+          $xexMagic = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes("$game\default.xex")[0..3])
+          "default.xex: $([math]::Round((Get-Item "$game\default.xex").Length/1MB,1)) MB, magic='$xexMagic'"
+          if ($xexMagic -ne 'XEX2' -and $xexMagic -ne 'XEX1') { throw "default.xex повреждён или не XEX (magic '$xexMagic')" }
+          if (-not (Test-Path "$game\data\webkit\EAWebkit.xex")) { throw "Нет game\data\webkit\EAWebkit.xex" }
+          # SHA-256: по ним можно сверить регион/версию образа и TU3 (апстрим тоже проверяет exe по SHA-256)
+          "SHA256 default.xex : $((Get-FileHash "$game\default.xex" -Algorithm SHA256).Hash)"
+          "SHA256 EAWebkit.xex: $((Get-FileHash "$game\data\webkit\EAWebkit.xex" -Algorithm SHA256).Hash)"
+          "SHA256 TU3 пакет   : $((Get-FileHash $env:TU3_PATH -Algorithm SHA256).Hash)"
+          if (-not $tuPkg -or -not (Test-Path $tuPkg)) { throw "TU3_PATH не задан - шаг Stage Title Update 3 не отработал" }
+          cmake --preset relwithdebinfo -DSKATE3_GAME_DATA_ROOT="$game" -DSKATE3_TITLE_UPDATE_PACKAGE="$tuPkg"
+          # -k 0: собрать всё, что можно, и показать ВСЕ ошибки; полный лог в build-codegen.log
+          cmake --build --preset relwithdebinfo --target generate-all -- -k 0 2>&1 | Tee-Object "$env:WS\build-codegen.log"
+          if ($LASTEXITCODE -ne 0) {
+            "=== ОШИБКИ СБОРКИ (FAILED / error:) ==="
+            Select-String -Path "$env:WS\build-codegen.log" -Pattern 'FAILED:|error:|fatal error|undefined' -Context 0,6 |
+              Select-Object -First 40 | ForEach-Object { $_.ToString() }
+            throw "codegen build failed"
+          }
+          Copy-Item "$env:WS\build-codegen.log" "$env:WS\skate3recomp\codegen.log" -Force   # попадёт в кэш
+          Set-Content "$env:WS\skate3recomp\tu3_used.txt" $env:TU3_PATH   # какой пакет использовал codegen (для PS4-конфигурации)
+          # patches, извлечённые из TU3, нужны рантайму как default.xexp / EAWebkit xexp в game\ (best effort)
+          Get-ChildItem "$env:WS\skate3recomp\out","$env:WS\skate3recomp\generated" -Recurse -Filter *.xexp -ErrorAction SilentlyContinue |
+            ForEach-Object { "xexp найден: $($_.FullName)"; if (-not (Test-Path "$game\$($_.Name)")) { Copy-Item $_.FullName "$game\$($_.Name)" } }
+          Get-ChildItem $game -Filter *.xexp | Select-Object Name,Length
+          # после codegen: вручную поправить REX_PHYS_HOST_OFFSET в generated\*_init.h (README, шаг 3)
+
+      - name: Save cache - codegen result
+        if: ${{ steps.cg.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            C:/ws/skate3recomp/**
+            !C:/ws/skate3recomp/game
+            !C:/ws/skate3recomp/game/**
+          key: ${{ steps.cg.outputs.cache-primary-key }}
+
+      # инкрементальная PS4-сборка: при падении на линковке объектники не пересобираются
+      - name: Restore cache - PS4 build dir
+        if: ${{ (inputs.build_eboot || inputs.build_ps4 || inputs.build_aio) && steps.cg.outputs.cache-hit == 'true' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: C:/ws/skate3recomp/out/build/ps4
+          key: ps4build-${{ inputs.cache_version }}-${{ github.run_id }}
+          restore-keys: |
+            ps4build-${{ inputs.cache_version }}-
+
+      - name: Диагностика codegen (применился ли TU3?)
+        continue-on-error: true
+        run: |
+          $root = "$env:WS\skate3recomp"
+          "=== манифест codegen (пути/патчи) ==="
+          Get-ChildItem "$root\out\build\relwithdebinfo\manifests" -Filter *.toml -ErrorAction SilentlyContinue | ForEach-Object {
+            "-- $($_.FullName)"
+            Select-String -Path $_.FullName -Pattern 'xex|patch|update|path' | Select-Object -First 30 | ForEach-Object { $_.Line }
+          }
+          "=== xex/xexp файлы в out\ и generated\ ==="
+          Get-ChildItem "$root\out","$root\generated" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '\.xex' } | Select-Object FullName,Length | Format-Table -AutoSize | Out-String -Width 250
+          "=== упоминания TU/patch в логе codegen ==="
+          if (Test-Path "$root\codegen.log") {
+            Select-String -Path "$root\codegen.log" -Pattern 'title update|TU3|xexp|patched|retail|Applying' | Select-Object -First 25 | ForEach-Object { $_.Line }
+          } else { "codegen.log нет в кэше (появится после запуска с новым cache_version)" }
+          "=== максимальный адрес функции в generated (retail-образ кончается раньше TU3) ==="
+          $max = 0
+          foreach ($f in Get-ChildItem "$root\generated" -Include *_init.h,*_config.h -Recurse -ErrorAction SilentlyContinue) {
+            foreach ($m in [regex]::Matches((Get-Content $f -Raw), 'sub_([0-9A-Fa-f]{8})')) {
+              $v = [Convert]::ToUInt32($m.Groups[1].Value,16); if ($v -gt $max) { $max = $v }
+            }
+          }
+          "max sub_ = 0x{0:X8}   (нужен >= 0x82F44E40)" -f $max
+          "=== REX_PHYS_HOST_OFFSET в generated\*_init.h (шаблон патчится SDK-патчем, ручной правки быть не должно) ==="
+          Get-ChildItem "$root\generated" -Filter *_init.h -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            "$($_.Name): $((Select-String -Path $_.FullName -Pattern 'REX_PHYS_HOST_OFFSET' -AllMatches | Measure-Object).Count) упоминаний"
+          }
+          "=== версия апстрима и изменённые порт-патчем файлы ==="
+          git -C $root log -1 --format="%H %cd %s" 2>&1
+          git -C $root status --short 2>&1 | Select-Object -First 25
+          "=== где упоминается 82F44E40 (исходники, конфиги, манифест) ==="
+          Get-ChildItem "$root\src","$root\config","$root\manifests","$root\out\build\relwithdebinfo\manifests" -Recurse -File -ErrorAction SilentlyContinue |
+            Select-String -Pattern '82F44E40' -Context 3,3 | Select-Object -First 8 | ForEach-Object { $_.ToString() }
+          "=== функции в generated рядом с 0x82F44E40 (+-0x1000) ==="
+          $near = @()
+          foreach ($f in Get-ChildItem "$root\generated" -Include *_init.h,*_config.h -Recurse -ErrorAction SilentlyContinue) {
+            foreach ($m in [regex]::Matches((Get-Content $f -Raw), 'sub_([0-9A-Fa-f]{8})')) {
+              $v = [Convert]::ToUInt32($m.Groups[1].Value,16)
+              if ($v -ge 0x82F43E40 -and $v -le 0x82F45E40) { $near += $v }
+            }
+          }
+          ($near | Sort-Object -Unique | ForEach-Object { '0x{0:X8}' -f $_ }) -join ', '
+
+      # ---------- 7. PS4 eboot (README, шаг 4) ----------
+      - name: Go (для сборки create-fself, если нет в SDK)
+        if: ${{ inputs.build_eboot || inputs.build_ps4 || inputs.build_aio }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: false
+
+      # make-pkg.ps1 / make-aio.ps1 берут Windows-инструменты по пути orbis-sdk-v1\sdk\bin\windows\
+      # (create-gp4.exe, PkgTool.Core.exe). В скачанном бандле там только .gitkeep, поэтому наполняем папку сами.
+      - name: Windows-инструменты для pkg (create-gp4, PkgTool.Core, create-fself) -> sdk\bin\windows
+        if: ${{ inputs.build_ps4 || inputs.build_aio }}
+        continue-on-error: true
+        run: |
+          $dst = "$env:WS\orbis-sdk-v1\sdk\bin\windows"
+          New-Item -ItemType Directory -Force $dst | Out-Null
+          # 1) из релиза/репозитория OpenOrbis, если там есть bin\windows
+          $oow = Get-ChildItem "$env:WS\oo054" -Recurse -Directory -Filter windows -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -match '\\bin\\windows$' } | Select-Object -First 1
+          if ($oow) { "копируем из $($oow.FullName)"; Copy-Item "$($oow.FullName)\*" $dst -Recurse -Force }
+
+          # 2) create-gp4 / create-fself / readoelf: Go-проект OpenOrbis (cmd\*), собираем недостающее
+          $need = @('create-gp4.exe','create-fself.exe') | Where-Object { -not (Test-Path "$dst\$_") }
+          if ($need) {
+            "не хватает: $($need -join ', ') - собираем из исходников (Go)"
+            $gsrc = "$env:WS\dl\create-fself"
+            if (-not (Test-Path $gsrc)) { git clone --depth 1 https://github.com/OpenOrbis/create-fself $gsrc }
+            Push-Location $gsrc
+            foreach ($d in Get-ChildItem "$gsrc\cmd" -Directory -ErrorAction SilentlyContinue) {
+              if (-not (Test-Path "$dst\$($d.Name).exe")) { go build -o "$dst\$($d.Name).exe" "./cmd/$($d.Name)"; "собран $($d.Name).exe" }
+            }
+            Pop-Location
+          }
+
+          # 3) PkgTool.Core.exe (.NET): ищем проект в репозиториях OpenOrbis и публикуем
+          if (-not (Test-Path "$dst\PkgTool.Core.exe")) {
+            foreach ($repo in 'OpenOrbis/PkgTool.Core','OpenOrbis/LibOrbisPkg','maxton/LibOrbisPkg') {
+              $rs = "$env:WS\dl\pkgtool-" + ($repo -replace '/','_')
+              git clone --depth 1 "https://github.com/$repo" $rs 2>&1 | Select-Object -Last 1
+              $proj = Get-ChildItem $rs -Recurse -Filter 'PkgTool.Core.csproj' -ErrorAction SilentlyContinue | Select-Object -First 1
+              if (-not $proj) { $proj = Get-ChildItem $rs -Recurse -Filter 'PkgTool*.csproj' -ErrorAction SilentlyContinue | Select-Object -First 1 }
+              if ($proj) {
+                "проект: $($proj.FullName)"
+                dotnet publish $proj.FullName -c Release -r win-x64 --self-contained false -o "$env:WS\dl\pkgtool-out"
+                $exe = Get-ChildItem "$env:WS\dl\pkgtool-out" -Filter '*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($exe) {
+                  Copy-Item "$env:WS\dl\pkgtool-out\*" $dst -Recurse -Force
+                  if ($exe.Name -ne 'PkgTool.Core.exe') { Copy-Item $exe.FullName "$dst\PkgTool.Core.exe" -Force }
+                  break
+                }
+              }
+            }
+          }
+          "=== sdk\bin\windows ==="
+          Get-ChildItem $dst -File | Select-Object Name,Length
+
+      - name: Build PS4 eboot
+        if: ${{ inputs.build_eboot || inputs.build_ps4 || inputs.build_aio }}
+        working-directory: C:\ws\skate3recomp
+        run: |
+          . "$env:WS\skate3-ps4-port\toolchain\env.ps1"
+          Remove-Item Env:CC,Env:CXX -ErrorAction SilentlyContinue   # для PS4-сборки, как в README
+          # ПРИЧИНА прошлой ошибки: exception_compat.cpp при SKATE3_HAS_TITLE_UPDATE=0 берёт retail-функцию
+          # sub_82F44E40, а при =1 - TU3-функцию sub_82F6FAA0. PS4-конфигурация не знала про пакет TU3,
+          # поэтому макрос был выключен. Передаём тот же пакет, что использовал codegen.
+          $root = "$env:WS\skate3recomp"
+          $tu = $env:TU3_PATH
+          if (-not $tu -or -not (Test-Path $tu)) {
+            if (Test-Path "$root\tu3_used.txt") { $tu = (Get-Content "$root\tu3_used.txt" -Raw).Trim() }
+          }
+          if (-not $tu -or -not (Test-Path $tu)) {
+            $tu = @("$root\TU3.upstream","$root\TU3.package") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $tu) { $tu = (Get-ChildItem $root -File -Filter 'TU_12K2276*' | Select-Object -First 1).FullName }
+          if (-not $tu) { throw "Пакет TU3 для PS4-конфигурации не найден" }
+          "TU3 для PS4-сборки: $tu"
+          "--- как апстрим включает TU3 в CMake:"
+          Get-ChildItem "$root\CMakeLists.txt","$root\cmake" -Recurse -File -ErrorAction SilentlyContinue |
+            Select-String -Pattern 'HAS_TITLE_UPDATE|TITLE_UPDATE_PACKAGE' | Select-Object -First 12 | ForEach-Object { "$($_.Path | Split-Path -Leaf):$($_.LineNumber): $($_.Line.Trim())" }
+          cmake -S . -B out/build/ps4 -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$env:WS\skate3-ps4-port\toolchain\ps4-modern.cmake" `
+            -DREXGLUE_ENABLE_TRACY=OFF -DREXGLUE_ENABLE_PERF_COUNTERS=ON `
+            -DSKATE3_TITLE_UPDATE_PACKAGE="$tu" -UCMAKE_PROJECT_INCLUDE
+          # --- быстрая проверка (1 файл, ~секунды): какую функцию exception_compat.cpp реально требует?
+          #     TU3 включён -> sub_82F6FAA0, выключен -> sub_82F44E40
+          function Check-TU {
+            $obj = "out/build/ps4/CMakeFiles/skate3.dir/src/exception_compat.cpp.obj"
+            if (Test-Path $obj) { Remove-Item $obj -Force }
+            # вывод ninja НЕ должен попасть в возвращаемое значение функции (раньше $state становился массивом)
+            $null = ninja -C out/build/ps4 CMakeFiles/skate3.dir/src/exception_compat.cpp.obj 2>&1
+            if (-not (Test-Path $obj)) { return [string]'нет-объектника' }
+            $und = (& llvm-nm -u $obj 2>&1 | Out-String)
+            if ($und -match '82F6FAA0') { return [string]'TU' }
+            if ($und -match '82F44E40') { return [string]'RETAIL' }
+            return [string]'ничего'
+          }
+          $state = Check-TU
+          "Попытка A (пакет TU3 передан в CMake): $state"
+
+          if ($state -ne 'TU') {
+            # Попытка B: апстрим мог искать извлечённые патчи в title_update_codegen\ СВОЕЙ папки сборки
+            $pcDir = "$root\out\build\relwithdebinfo\title_update_codegen"
+            if (Test-Path $pcDir) {
+              Copy-Item $pcDir "$root\out\build\ps4\title_update_codegen" -Recurse -Force
+              cmake -S . -B out/build/ps4 -DSKATE3_TITLE_UPDATE_PACKAGE="$tu" | Out-Null
+              $state = Check-TU
+              "Попытка B (title_update_codegen скопирован в PS4-сборку): $state"
+            }
+          }
+          if ($state -ne 'TU') {
+            # Попытка C: принудительно объявить макрос для всех целей (CMAKE_PROJECT_INCLUDE устойчив к флагам toolchain)
+            Set-Content "$env:WS\force_tu.cmake" "add_compile_definitions(SKATE3_HAS_TITLE_UPDATE=1)"
+            cmake -S . -B out/build/ps4 -DSKATE3_TITLE_UPDATE_PACKAGE="$tu" "-DCMAKE_PROJECT_INCLUDE=$env:WS/force_tu.cmake" | Out-Null
+            $state = Check-TU
+            "Попытка C (макрос объявлен принудительно): $state"
+          }
+          if ($state -ne 'TU') {
+            "=== TU3 так и не включился. Где в проекте определяется SKATE3_HAS_TITLE_UPDATE: ==="
+            Get-ChildItem "$root\src","$root\cmake","$root\CMakeLists.txt","$root\third_party\rexglue-sdk\include" -Recurse -File -ErrorAction SilentlyContinue |
+              Select-String -Pattern 'SKATE3_HAS_TITLE_UPDATE' | Select-Object -First 25 |
+              ForEach-Object { "$($_.Path.Replace($root,'')):$($_.LineNumber): $($_.Line.Trim())" }
+            throw "TU3-макрос не включён (состояние: $state) - см. строки выше"
+          }
+          "TU3 включён: exception_compat.cpp использует sub_82F6FAA0"
+          ninja -C out/build/ps4 -k 0 skate3 2>&1 | Tee-Object "$env:WS\build-ps4.log"
+          if ($LASTEXITCODE -ne 0) {
+            # Линковка могла пройти, а упасть - пост-шаг create-fself: CMake зовёт sdk/bin/LINUX/create-fself,
+            # а это Linux-бинарник, на Windows он не запускается ("unknown error"). Делаем eboot сами.
+            $elf = "out/build/ps4/skate3"
+            $compileErr = Select-String -Path "$env:WS\build-ps4.log" -Pattern 'error:|undefined symbol' -Quiet
+            if ((Test-Path $elf) -and -not $compileErr) {
+              "=== линковка прошла, падает пост-шаг create-fself -> делаем eboot сами ==="
+              "размер skate3 (ELF): $([math]::Round((Get-Item $elf).Length/1MB,1)) MB"
+              $fself = Get-ChildItem "$env:WS\orbis-sdk-v1","$env:WS\oo054","$env:WS\tools" -Recurse -Filter 'create-fself*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+              if (-not $fself) {
+                "create-fself.exe нет в SDK (в бандле нет Windows-инструментов). Что лежит в bin\:"
+                Get-ChildItem "$env:WS\orbis-sdk-v1\sdk\bin","$env:WS\oo054\bin" -Recurse -File -ErrorAction SilentlyContinue |
+                  Select-Object -First 30 FullName
+                "Собираем create-fself из исходников OpenOrbis (Go)..."
+                $gsrc = "$env:WS\dl\create-fself"
+                if (Test-Path $gsrc) { Remove-Item $gsrc -Recurse -Force }
+                git clone --depth 1 https://github.com/OpenOrbis/create-fself $gsrc
+                $mainFile = Get-ChildItem $gsrc -Recurse -Filter *.go -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -notmatch '\\(vendor|test|tests)\\' -and ((Get-Content $_.FullName -TotalCount 30) -match '^package main') } |
+                  Select-Object -First 1
+                if ($mainFile) {
+                  "main-пакет: $($mainFile.FullName)"
+                  New-Item -ItemType Directory -Force "$env:WS\tools" | Out-Null
+                  Push-Location $mainFile.DirectoryName
+                  go build -o "$env:WS\tools\create-fself.exe" .
+                  Pop-Location
+                  $fself = Get-Item "$env:WS\tools\create-fself.exe" -ErrorAction SilentlyContinue
+                } else { "В репозитории create-fself не найден package main" ; Get-ChildItem $gsrc | Select-Object Name }
+              }
+              if ($fself) {
+                "Используем: $($fself.FullName)"
+                $env:OO_PS4_TOOLCHAIN = "$env:WS/orbis-sdk-v1/sdk"
+                & $fself.FullName "-in=$root/out/build/ps4/skate3" "-out=$root/out/build/ps4/skate3.oelf" --eboot "$root/out/build/ps4/eboot.bin" --paid 0x3800000000000011
+                "create-fself код возврата: $LASTEXITCODE"
+                if (Test-Path "$root/out/build/ps4/eboot.bin") {
+                  "eboot.bin создан: $([math]::Round((Get-Item "$root/out/build/ps4/eboot.bin").Length/1MB,1)) MB"
+                  $global:LASTEXITCODE = 0
+                }
+              }
+            }
+          }
+          if ($LASTEXITCODE -ne 0) {
+            "=== ОШИБКИ СБОРКИ (FAILED / error:) ==="
+            Select-String -Path "$env:WS\build-ps4.log" -Pattern 'FAILED:|error:|fatal error|undefined' -Context 0,6 |
+              Select-Object -First 40 | ForEach-Object { $_.ToString() }
+            # диагностика undefined symbol: есть ли такая функция в сгенерированном коде вообще?
+            $syms = Select-String -Path "$env:WS\build-ps4.log" -Pattern 'undefined symbol: (\S+)' |
+                    ForEach-Object { $_.Matches[0].Groups[1].Value } | Sort-Object -Unique | Select-Object -First 10
+            foreach ($sym in $syms) {
+              $addr = ($sym -replace '^(__imp__)?sub_', '')
+              $hits = Select-String -Path "$env:WS\skate3recomp\generated\*.cpp","$env:WS\skate3recomp\generated\*.h" -Pattern $addr -List -ErrorAction SilentlyContinue
+              "--- $sym : упоминаний в generated\: $(@($hits).Count)"
+              $hits | Select-Object -First 3 | ForEach-Object { "    $($_.Path)" }
+            }
+            "Файлов generated\*.cpp: $((Get-ChildItem "$env:WS\skate3recomp\generated" -Filter *.cpp -ErrorAction SilentlyContinue).Count)"
+            throw "PS4 build failed"
+          }
+          if (-not (Test-Path out/build/ps4/eboot.bin)) { throw "eboot.bin не собрался" }
+
+      - name: Upload eboot.bin (артефакт, только для твоего приватного репозитория)
+        if: ${{ inputs.build_eboot || inputs.build_ps4 || inputs.build_aio }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: eboot
+          path: C:/ws/skate3recomp/out/build/ps4/eboot.bin
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: warn
+
+      - name: Save cache - PS4 build dir (даже если сборка упала)
+        if: ${{ always() && (inputs.build_eboot || inputs.build_ps4 || inputs.build_aio) }}
+        uses: actions/cache/save@v4
+        with:
+          path: C:/ws/skate3recomp/out/build/ps4
+          key: ps4build-${{ inputs.cache_version }}-${{ github.run_id }}
+
+      # ---------- 8. Арт и стартовый сейв (art\ из README) ----------
+      - name: Fetch art (icon0.png, pic1.png, optional defaults\save)
+        if: ${{ inputs.build_ps4 || inputs.build_aio }}
+        env:
+          ART_ZIP_URL: ${{ secrets.ART_ZIP_URL }}
+        run: |
+          $art = "$env:WS\art"
+          if ($env:ART_ZIP_URL) {
+            Invoke-WebRequest $env:ART_ZIP_URL -OutFile "$env:WS\dl\art.zip"
+            Expand-Archive "$env:WS\dl\art.zip" $art -Force
+          } elseif (Test-Path "$env:WS\skate3-ps4-port\art") {
+            Copy-Item "$env:WS\skate3-ps4-port\art\*" $art -Recurse -Force
+          }
+          # Нет арта - рисуем заглушки (icon0 512x512, pic1 1920x1080), чтобы pkg всё равно собрался
+          if (-not (Test-Path "$art\icon0.png") -or -not (Test-Path "$art\pic1.png")) {
+            "art не найден - генерируем заглушки"
+            New-Item -ItemType Directory -Force $art | Out-Null
+            python -m pip install --quiet pillow
+            @'
+          import os
+          from PIL import Image, ImageDraw, ImageFont
+          art = os.environ["ART_DIR"]
+          def make(path, w, h, size):
+              img = Image.new("RGB", (w, h))
+              px = img.load()
+              for y in range(h):                      # вертикальный градиент
+                  t = y / (h - 1)
+                  c = (int(20 + 30 * t), int(24 + 50 * t), int(40 + 90 * t))
+                  for x in range(w): px[x, y] = c
+              d = ImageDraw.Draw(img)
+              try: font = ImageFont.load_default(size=size)
+              except TypeError: font = ImageFont.load_default()
+              text = "SKATE 3"
+              bbox = d.textbbox((0, 0), text, font=font)
+              d.text(((w - (bbox[2]-bbox[0])) / 2, (h - (bbox[3]-bbox[1])) / 2), text, fill=(240, 240, 240), font=font)
+              img.save(path, "PNG")
+          if not os.path.exists(os.path.join(art, "icon0.png")): make(os.path.join(art, "icon0.png"), 512, 512, 96)
+          if not os.path.exists(os.path.join(art, "pic1.png")):  make(os.path.join(art, "pic1.png"), 1920, 1080, 220)
+          '@ | Set-Content -Encoding utf8 "$env:WS\dl\mkart.py"
+            $env:ART_DIR = $art
+            python "$env:WS\dl\mkart.py"
+            if ($LASTEXITCODE) { throw "Не удалось создать заглушки арта" }
+          }
+          foreach ($f in 'icon0.png','pic1.png') {
+            if (-not (Test-Path "$art\$f")) { throw "Нет art\$f" }
+          }
+          # defaults\save\ (SKATER.P, RMCDEL, ALIAS_SKATER.header) - необязательно
+
+      # ---------- 9. Обычный pkg (официальный скрипт репо) ----------
+      - name: make-pkg.ps1
+        if: ${{ inputs.build_ps4 }}
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass -Force
+          & "$env:WS\skate3-ps4-port\scripts\make-pkg.ps1"
+          if ($LASTEXITCODE) { throw "make-pkg.ps1 failed" }
+
+      # ---------- 10. AIO pkg (официальный скрипт репо) ----------
+      - name: make-aio.ps1
+        if: ${{ inputs.build_aio }}
+        run: |
+          if (-not (Test-Path "$env:WS\tools\orbis-pub-cmd.exe")) {
+            throw "Нужен patched orbis-pub-cmd 3.87: задай секрет ORBIS_PUB_URL"
+          }
+          Set-ExecutionPolicy -Scope Process Bypass -Force
+          # скрипт сам: gp4 с абсолютными orig_path, FORMAT=obs, img_create --oformat pkg --skip_digest
+          & "$env:WS\skate3-ps4-port\scripts\make-aio.ps1"
+          if ($LASTEXITCODE) {
+            "=== make-aio.ps1: какие инструменты и пути он использует ==="
+            Select-String -Path "$env:WS\skate3-ps4-port\scripts\make-aio.ps1","$env:WS\skate3-ps4-port\scripts\config.ps1" `
+              -Pattern 'create-gp4|PkgTool|\.exe|oo054|OO_PS4|orbis-pub|gp4' -ErrorAction SilentlyContinue |
+              Select-Object -First 30 | ForEach-Object { "$($_.Filename):$($_.LineNumber): $($_.Line.Trim())" }
+            "=== где реально лежат create-gp4 / PkgTool ==="
+            Get-ChildItem $env:WS -Recurse -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match '^(create-gp4|PkgTool)' } | Select-Object -First 20 FullName
+            throw "make-aio.ps1 failed"
+          }
+          Get-ChildItem $env:WS -Recurse -Include *.pkg | Select-Object FullName,@{n='GB';e={[math]::Round($_.Length/1GB,2)}}
+
+      # ---------- 11. Выгрузка ----------
+      # AIO содержит игровые файлы: артефакт виден только тем, у кого есть доступ к репо.
+      - name: Upload pkg(s)
+        if: ${{ inputs.build_ps4 || inputs.build_aio }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Skate3-pkg
+          path: |
+            C:/ws/**/*.pkg
+            !C:/ws/oo054/**
+            !C:/ws/orbis-sdk-v1/**
+            !C:/ws/dl/**
+            !C:/ws/tools/**
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload build logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: C:\ws\build-*.log
+          if-no-files-found: ignore
