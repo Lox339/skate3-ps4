@@ -866,6 +866,26 @@ jobs:
           key: ps4build-${{ inputs.cache_version }}-${{ github.run_id }}
 
       # ---------- 8. Арт и стартовый сейв (art\ из README) ----------
+      # TU3 xexp (default.xexp + EAWebkit.xexp) нужны рядом с игрой в /app0/game.
+      # Без них eboot уходит в установщик TU3 и зависает на чёрном экране.
+      # Шаг идёт ПОСЛЕ распаковки ISO (та стирает game\) и не зависит от кэша codegen.
+      - name: Stage TU3 xexp рядом с игрой (game\default.xexp, game\data\webkit\EAWebkit.xexp)
+        if: ${{ inputs.build_ps4 || inputs.build_aio }}
+        run: |
+          $tu   = "$env:WS\skate3recomp\out\build\relwithdebinfo\title_update_codegen"
+          $game = "$env:WS\skate3recomp\game"
+          if (-not (Test-Path $game)) { throw "Нет папки игры $game - распаковка ISO не прошла" }
+          $src1 = "$tu\default.xexp"
+          $src2 = "$tu\data\webkit\EAWebkit.xexp"
+          if (-not (Test-Path $src1)) { throw "Нет $src1 - codegen не извлёк patch TU3" }
+          if (-not (Test-Path $src2)) { throw "Нет $src2 - codegen не извлёк patch EAWebkit TU3" }
+          New-Item -ItemType Directory -Force "$game\data\webkit" | Out-Null
+          Copy-Item $src1 "$game\default.xexp" -Force
+          Copy-Item $src2 "$game\data\webkit\EAWebkit.xexp" -Force
+          # старый плоский EAWebkit.xexp в корне игры не нужен, и он мог путать установщик
+          Remove-Item "$game\EAWebkit.xexp" -Force -ErrorAction SilentlyContinue
+          Get-ChildItem $game -Recurse -Filter *.xexp | ForEach-Object { "$($_.FullName.Replace($game,'game'))  $($_.Length) байт" }
+
       - name: Fetch art (icon0.png, pic1.png, optional defaults\save)
         if: ${{ inputs.build_ps4 || inputs.build_aio }}
         env:
